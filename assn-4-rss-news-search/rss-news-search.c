@@ -25,11 +25,16 @@ static void ProcessSingleNewsItem(streamtokenizer *st, hashset *database,
 static void ExtractElement(streamtokenizer *st, const char *htmlTag, char dataBuffer[], int bufferLength);
 static void ParseArticle(const char *articleTitle, const char *articleDescription, const char *articleURL, hashset *database, hashset *stoplist);
 static void ScanArticle(streamtokenizer *st, const char *articleTitle, const char *unused, const char *articleURL, hashset *database, hashset *stoplist);
-static void QueryIndices();
-static void ProcessResponse(const char *word);
+static void QueryIndices(hashset *stoplist, hashset *database);
+static void ProcessResponse(const char *word, hashset *stoplist, hashset *database);
 static bool WordIsWellFormed(const char *word);
 
 static void build_stoplist(hashset *stoplist, const char *stoplist_filename);
+static bool is_stop_word(hashset *stoplist, const char *word);
+static vector *fetch_urls(hashset *database, const char *word);
+static void print_urls(const char *word, vector *urls);
+static void get_short_url(const char *article_url, char *short_url);
+static void to_lower_case(char *word);
 /**
  * Function: main
  * --------------
@@ -74,7 +79,7 @@ static int StringHash(const void *elem, int numBuckets)
 
 static int StringCompare(const void *elem1, const void *elem2)
 {
-    return strcmp(*(const char **) elem1, *(const char **) elem2);
+    return strcasecmp(*(const char **) elem1, *(const char **) elem2);
 }
 
 static void StringFree(void *elem)
@@ -87,7 +92,7 @@ static int  data_entry_compare(const void *elem1, const void *elem2)
     data_entry *entry1 = (data_entry*)elem1;
     data_entry *entry2 = (data_entry*)elem2;
 
-    return strcmp(entry1->word, entry2->word);
+    return strcasecmp(entry1->word, entry2->word);
 }
 
 static void data_entry_free(void *elem)
@@ -114,7 +119,6 @@ int main(int argc, char **argv)
 {
     hashset stoplist;
     hashset database;
-    int count;
     HashSetNew(&stoplist, sizeof(char*), KNumBuckets, 
             StringHash, StringCompare, StringFree);
 
@@ -125,11 +129,10 @@ int main(int argc, char **argv)
 
     Welcome(kWelcomeTextFile);
     BuildIndices((argc == 1) ? kDefaultFeedsFile : argv[1], &database, &stoplist);
-    //QueryIndices();
-    count = HashSetCount(&database);
-    printf("database count = %d\n", count);
+    QueryIndices(&stoplist, &database);
     HashSetDispose(&stoplist);
     HashSetDispose(&database);
+
     return 0;
 }
 
@@ -195,7 +198,6 @@ static void BuildIndices(const char *feedsFileName, hashset *database,
         STSkipOver(&st, ": ");		 // now ignore the semicolon and any whitespace directly after it
         STNextToken(&st, remoteFileName, sizeof(remoteFileName));   
         ProcessFeed(remoteFileName, database, stoplist);
-        printf("remoteFileName = %s\n", remoteFileName);
     }
 
     STDispose(&st);
@@ -421,7 +423,7 @@ static void ParseArticle(const char *articleTitle, const char *articleDescriptio
     switch (urlconn.responseCode) {
         case 0: printf("Unable to connect to \"%s\".  Domain name or IP address is nonexistent.\n", articleURL);
                 break;
-        case 200: printf("Scanning \"%s\" from \"http://%s\"\n", articleTitle, u.serverName);
+        case 200: //printf("Scanning \"%s\" from \"http://%s\"\n", articleTitle, u.serverName);
                   STNew(&st, urlconn.dataStream, kTextDelimiters, false);
                   ScanArticle(&st, articleTitle, articleDescription, articleURL, database, stoplist);
                   STDispose(&st);
@@ -453,10 +455,12 @@ static void ParseArticle(const char *articleTitle, const char *articleDescriptio
 
 static void ScanArticle(streamtokenizer *st, const char *articleTitle, const char *unused, const char *articleURL, hashset *database, hashset *stoplist)
 {
-    int numWords = 0;
     char word[1024];
-    char longestWord[1024] = {'\0'};
-
+    char short_url[1024];
+    
+    get_short_url(articleURL, short_url);
+    to_lower_case(word);
+    printf("[%s] Indexing \"%s\"\n", short_url, articleTitle);
     while (STNextToken(st, word, sizeof(word))) {
         if (strcasecmp(word, "<") == 0) {
             SkipIrrelevantContent(st); // in html-utls.h
@@ -464,8 +468,7 @@ static void ScanArticle(streamtokenizer *st, const char *articleTitle, const cha
             RemoveEscapeCharacters(word);
             if (WordIsWellFormed(word)) {
                 char *m_word = strdup(word);
-                printf("query word = %s\n", m_word);
-                if ((HashSetLookup(stoplist, &m_word) == NULL)) {
+                if (!is_stop_word(stoplist, m_word)) {
                     data_entry *entry = HashSetLookup(database, &m_word);
                     char *url = strdup(articleURL);
 
@@ -473,6 +476,7 @@ static void ScanArticle(streamtokenizer *st, const char *articleTitle, const cha
                         //create a new entry
                         data_entry m_entry;
                         m_entry.word = m_word;
+                        printf("new word = %s\n", m_word);
                         VectorNew(&m_entry.urls, sizeof(char*), StringFree, 4);
                         VectorAppend(&m_entry.urls ,&url);
 
@@ -485,24 +489,15 @@ static void ScanArticle(streamtokenizer *st, const char *articleTitle, const cha
                         free(m_word);
                     }      
                     
-                    numWords++;
                 } else {
                     free(m_word);
                     
                 }
 
-                if (strlen(word) > strlen(longestWord))
-                    strcpy(longestWord, word);
-
             }
         }
     }
 
-    printf("\tWe counted %d well-formed words [including duplicates].\n", numWords);
-    printf("\tThe longest word scanned was \"%s\".", longestWord);
-    if (strlen(longestWord) >= 15 && (strchr(longestWord, '-') == NULL)) 
-        printf(" [Ooooo... long word!]");
-    printf("\n");
 }
 
 /** 
@@ -513,15 +508,16 @@ static void ScanArticle(streamtokenizer *st, const char *articleTitle, const cha
  * that contain that word.
  */
 
-static void QueryIndices()
+static void QueryIndices(hashset *stoplist, hashset *database)
 {
     char response[1024];
     while (true) {
         printf("Please enter a single query term that might be in our set of indices [enter to quit]: ");
         fgets(response, sizeof(response), stdin);
         response[strlen(response) - 1] = '\0';
-        if (strcasecmp(response, "") == 0) break;
-        ProcessResponse(response);
+        if (strcasecmp(response, "") == 0)
+            break;
+        ProcessResponse(response, stoplist, database );
     }
 }
 
@@ -532,11 +528,19 @@ static void QueryIndices()
  * for a list of web documents containing the specified word.
  */
 
-static void ProcessResponse(const char *word)
+static void ProcessResponse(const char *word, hashset *stoplist, hashset *database)
 {
     if (WordIsWellFormed(word)) {
-        printf("\tWell, we don't have the database mapping words to online news articles yet, but if we DID have\n");
-        printf("\tour hashset of indices, we'd list all of the articles containing \"%s\".\n", word);
+        if (is_stop_word(stoplist, word))
+            printf("%s is too common a word to be taken seriously.  Please be more specific.",
+                    word);
+        else {
+            vector *urls;
+            if ((urls = fetch_urls(database, word)) != NULL) {
+                print_urls(word, urls);
+            } else
+                printf("None of today's news articles contain the word \"%s\"\n", word);
+        }   
     } else {
         printf("\tWe won't be allowing words like \"%s\" into our set of indices.\n", word);
     }
@@ -578,14 +582,60 @@ static void build_stoplist(hashset *stoplist, const char *stop_word_filename)
     STNew(&st, infile, kNewLineDelimiters, true);
     while (STNextToken(&st, buffer, sizeof(buffer))) {
         word = strdup(buffer);
-        printf("%s\n", buffer);
         assert(word != NULL);
         HashSetEnter(stoplist, &word);
     }
-    printf("stop list size = %d\n", HashSetCount(stoplist));
     printf("\n");
     STDispose(&st); // remember that STDispose doesn't close the file, since STNew doesn't open one.. 
     fclose(infile);
 
 }
 
+static bool is_stop_word(hashset *stoplist, const char *word)
+{
+    
+    if (HashSetLookup(stoplist, &word) == NULL)
+        return false;
+
+    return true;
+}
+
+static vector *fetch_urls(hashset *database,const char *word)
+{
+    data_entry *entry = HashSetLookup(database, &word);
+    if (entry != NULL)
+        return &(entry->urls);
+
+    return NULL;
+}
+static void print_urls(const char *word, vector *urls)
+{
+    printf("print urls\n");
+    int len = VectorLength(urls);
+    char *url;
+    int i;
+    printf("len = %d\n", len);
+    for (i = 0; i < len; i++) {
+        url = *(char**)VectorNth(urls, i);
+        assert(url != NULL);
+
+        //printf("%d.) \"%s\"\n\t\"%s\"\n", i+1, word, url);
+        printf("%d.) %s --> %s\n", i+1, word, url);
+    }
+
+}
+
+static void get_short_url(const char *article_url, char *short_url)
+{
+    sscanf(article_url, "%*[^:]://%[^/]", short_url);
+}
+
+
+static void to_lower_case(char *word)
+{
+    char *p = word;
+
+    while (*p++ != '\0')
+        *p = tolower(*p);
+
+}
